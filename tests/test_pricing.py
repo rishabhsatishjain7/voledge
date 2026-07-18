@@ -10,11 +10,14 @@ and Greeks sanity checks (e.g. delta in [0, 1] for calls, gamma > 0).
 
 import math
 
+import numpy as np
 import pytest
 
 from src.pricing.black_scholes import BSInputs, OptionType, bs_call, bs_put, bs_price
 from src.pricing.binomial_tree import binomial_price
 from src.pricing.monte_carlo import mc_price
+from src.pricing.heston import HestonParams, heston_price, calibrate_heston
+from src.risk import parametric_var, monte_carlo_var, stress_test
 from src.greeks import compute_greeks
 from src.implied_vol import implied_volatility
 
@@ -152,6 +155,121 @@ class TestGreeks:
         ).delta
 
         assert analytical_delta == pytest.approx(fd_delta, abs=1e-4)
+
+
+class TestHeston:
+    def test_degenerate_case_matches_black_scholes_call(self):
+        """v0 = theta = sigma^2 with sigma_v -> 0 removes stochastic vol
+        entirely, leaving constant variance - Heston must collapse to
+        Black-Scholes exactly in this limit."""
+        params = HestonParams(v0=sigma**2, kappa=2.0, theta=sigma**2, sigma_v=1e-4, rho=0.0)
+        heston_p = heston_price(S, K, T, r, params, OptionType.CALL)
+        bs_p = bs_call(S, K, T, r, sigma)
+        assert heston_p == pytest.approx(bs_p, abs=1e-3)
+
+    def test_degenerate_case_matches_black_scholes_put(self):
+        params = HestonParams(v0=sigma**2, kappa=2.0, theta=sigma**2, sigma_v=1e-4, rho=0.0)
+        heston_p = heston_price(S, K, T, r, params, OptionType.PUT)
+        bs_p = bs_put(S, K, T, r, sigma)
+        assert heston_p == pytest.approx(bs_p, abs=1e-3)
+
+    def test_put_call_parity(self):
+        """Heston prices must satisfy the same model-independent put-call
+        parity as any European option pricer."""
+        params = HestonParams(v0=0.04, kappa=1.5, theta=0.04, sigma_v=0.5, rho=-0.7)
+        call = heston_price(S, K, T, r, params, OptionType.CALL)
+        put = heston_price(S, K, T, r, params, OptionType.PUT)
+        lhs = call - put
+        rhs = S - K * math.exp(-r * T)
+        assert lhs == pytest.approx(rhs, abs=1e-2)
+
+    def test_negative_rho_produces_downward_skew(self):
+        """Negative correlation between spot and vol (the equity 'leverage
+        effect') should produce IV decreasing in strike - not a symmetric
+        smile. This is the qualitative behavior the whole model exists to
+        capture, so it's worth checking directly rather than just
+        checking prices are self-consistent."""
+        params = HestonParams(v0=0.04, kappa=1.5, theta=0.04, sigma_v=0.5, rho=-0.7)
+        low_strike_price = heston_price(S, 90.0, T, r, params, OptionType.CALL)
+        high_strike_price = heston_price(S, 110.0, T, r, params, OptionType.CALL)
+
+        low_iv = implied_volatility(low_strike_price, S, 90.0, T, r, OptionType.CALL).iv
+        high_iv = implied_volatility(high_strike_price, S, 110.0, T, r, OptionType.CALL).iv
+
+        assert low_iv is not None and high_iv is not None
+        assert low_iv > high_iv
+
+    def test_invalid_params_raise(self):
+        with pytest.raises(ValueError):
+            HestonParams(v0=-0.01, kappa=1.0, theta=0.04, sigma_v=0.5, rho=0.0)
+        with pytest.raises(ValueError):
+            HestonParams(v0=0.04, kappa=0.0, theta=0.04, sigma_v=0.5, rho=0.0)
+        with pytest.raises(ValueError):
+            HestonParams(v0=0.04, kappa=1.0, theta=0.04, sigma_v=0.5, rho=1.5)
+
+    def test_calibration_recovers_known_parameters(self):
+        """Generate prices from a known Heston parameter set, then check
+        calibration recovers prices close to those targets (recovering
+        the exact parameters isn't guaranteed - Heston calibration is a
+        classically underdetermined problem - but recovering the price
+        surface it was fit to is the meaningful correctness check)."""
+        true_params = HestonParams(v0=0.04, kappa=2.0, theta=0.04, sigma_v=0.4, rho=-0.6)
+        strikes = np.array([85.0, 90.0, 95.0, 100.0, 105.0, 110.0, 115.0])
+        true_prices = np.array(
+            [heston_price(S, k, T, r, true_params, OptionType.CALL) for k in strikes]
+        )
+
+        calibrated, rmse = calibrate_heston(S, T, r, strikes, true_prices, OptionType.CALL)
+
+        assert rmse < 0.05  # prices in this scenario range roughly $0.50-$18
+
+
+class TestRisk:
+    def test_parametric_and_monte_carlo_var_roughly_agree(self):
+        """For a short horizon (1 day), convexity effects are small, so
+        the linearized (parametric) and full-revaluation (Monte Carlo)
+        VaR methods should agree fairly closely - a large divergence here
+        would indicate a bug in one of the two implementations, since
+        they're modeling the same underlying risk two different ways."""
+        pv = parametric_var(S, K, T, r, sigma, OptionType.CALL, horizon_days=1, confidence=0.95)
+        mv = monte_carlo_var(
+            S, K, T, r, sigma, OptionType.CALL, horizon_days=1, confidence=0.95, seed=42
+        )
+        assert pv.var == pytest.approx(mv.var, rel=0.15)
+
+    def test_var_positive_for_long_position(self):
+        pv = parametric_var(S, K, T, r, sigma, OptionType.CALL, position_size=1.0)
+        assert pv.var > 0
+        assert pv.cvar >= pv.var  # CVaR (expected shortfall) is at least as large as VaR
+
+    def test_var_scales_with_position_size(self):
+        """Doubling the position size should roughly double the VaR
+        (delta-normal VaR is exactly linear in position size)."""
+        pv1 = parametric_var(S, K, T, r, sigma, OptionType.CALL, position_size=1.0)
+        pv2 = parametric_var(S, K, T, r, sigma, OptionType.CALL, position_size=2.0)
+        assert pv2.var == pytest.approx(2 * pv1.var, rel=1e-9)
+
+    def test_higher_confidence_gives_larger_var(self):
+        pv_95 = parametric_var(S, K, T, r, sigma, OptionType.CALL, confidence=0.95)
+        pv_99 = parametric_var(S, K, T, r, sigma, OptionType.CALL, confidence=0.99)
+        assert pv_99.var > pv_95.var
+
+    def test_stress_test_zero_shock_matches_baseline(self):
+        """The (spot 0%, vol 0%) cell must be exactly zero - it's the
+        no-shock scenario, i.e. today's position value vs. itself."""
+        result = stress_test(S, K, T, r, sigma, OptionType.CALL, position_size=1.0)
+        assert result.loc["spot +0%", "vol +0%"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_stress_test_long_call_gains_from_positive_shocks(self):
+        """A long call should gain value from both a spot rally (positive
+        delta) and a vol increase (positive vega) - and lose value from
+        the opposite moves. This checks the signs of the whole table are
+        economically sane, not just that the zero-shock cell is zero."""
+        result = stress_test(S, K, T, r, sigma, OptionType.CALL, position_size=1.0)
+        assert result.loc["spot +20%", "vol +10%"] > 0
+        assert result.loc["spot -20%", "vol -10%"] < 0
+        assert result.loc["spot +0%", "vol +10%"] > 0  # vega effect alone
+        assert result.loc["spot +0%", "vol -10%"] < 0
 
 
 class TestImpliedVol:
