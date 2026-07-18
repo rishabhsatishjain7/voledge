@@ -38,6 +38,21 @@ not a directional edge.
   dynamically rehedging its delta exposure under GBM, financing the cash
   difference at the risk-free rate, to measure how discrete rebalancing
   error compares to the idealized continuous-time hedge.
+- **Heston stochastic volatility** (`src/pricing/heston.py`) addresses
+  the constant-vol assumption directly: the smile above is empirical
+  proof that a single sigma doesn't fit the market, so Heston lets
+  variance itself follow a mean-reverting stochastic process correlated
+  with the asset's returns. Priced via the classical Heston (1993)
+  semi-closed-form (two probabilities recovered by numerical integration
+  of their characteristic functions, "Little Trap" formulation for
+  numerical stability), calibrated to a market price set via bounded
+  least-squares.
+- **Risk metrics** (`src/risk.py`) computes 1-day VaR two ways -
+  delta-normal (fast, linearizes P&L via delta) and Monte Carlo full
+  revaluation (slower, captures gamma and payoff convexity) - compared
+  directly against each other, plus a scenario stress-test grid (P&L
+  under named spot/vol shocks, independent of any distributional
+  assumption).
 
 All three pricers agree closely on a plain-vanilla ATM call
 (S=K=100, T=1, r=5%, σ=20%): Black-Scholes **10.4506**, binomial tree
@@ -74,6 +89,35 @@ tails that force the Brent fallback:
 | 126 | 0.6234 | -0.0027 |
 | 252 | 0.4318 | +0.0060 |
 
+### Heston calibration to the smile
+
+Calibrating Heston to the same target skew above recovers a smile of
+similar shape (RMSE = **0.1228** in price units across 25 strikes ranging
+$0.001-$31), without being told the functional form in advance - the
+calibrated parameters (v0=0.0057, kappa=20.0, theta=0.0431, sigma_v=1.43,
+rho=-0.612) show the expected negative spot-vol correlation:
+
+![Heston calibration](assets/heston_calibration.png)
+
+`kappa` calibrating to its upper bound is itself informative: it's the
+fit signaling that this specific quadratic target skew isn't exactly
+representable by Heston's 5-parameter functional form - see Limitations.
+
+### Risk: VaR and stress testing
+
+1-day 95% VaR for a long 100-contract ATM call, computed two ways:
+
+| Method | VaR | CVaR |
+|---|---:|---:|
+| Parametric (delta-normal) | 112.56 | 141.15 |
+| Monte Carlo (full revaluation) | 109.24 | 134.40 |
+
+The two methods agree within **3.0%** at this short horizon, where
+convexity effects are small - a real risk desk would expect this level of
+agreement and get suspicious of a larger gap.
+
+![Stress test grid](assets/stress_test.png)
+
 ## Repo structure
 
 ```
@@ -83,15 +127,17 @@ voledge/
 │   ├── pricing/
 │   │   ├── black_scholes.py
 │   │   ├── binomial_tree.py
-│   │   └── monte_carlo.py
+│   │   ├── monte_carlo.py
+│   │   └── heston.py
 │   ├── greeks.py
 │   ├── implied_vol.py
 │   ├── hedging.py
+│   ├── risk.py
 │   └── data.py
 ├── notebooks/
 │   └── analysis.ipynb        # generates every plot in this README
 ├── tests/
-│   └── test_pricing.py       # 19 tests: parity, convergence, boundaries, Greeks, IV round-trips
+│   └── test_pricing.py       # 31 tests: parity, convergence, boundaries, Greeks, IV, Heston, VaR/stress
 ├── streamlit_app.py           # live demo: IV smile + hedging simulator
 ├── requirements.txt
 └── LICENSE
@@ -122,28 +168,48 @@ streamlit run streamlit_app.py
 
 - **European exercise assumption for the Black-Scholes baseline.** American
   early-exercise value is only captured by the binomial tree branch
-  (`american=True`), not by the BS or Monte Carlo pricers.
+  (`american=True`), not by the BS, Monte Carlo, or Heston pricers.
 - **No discrete dividends.** Dividend yield `q` is modeled as continuous;
   real equities pay discrete dividends that create small jumps the
   continuous-yield approximation doesn't capture, particularly for
   short-dated options around an ex-dividend date.
-- **Constant volatility assumption.** Black-Scholes and the tree both
-  assume a single constant σ. The IV smile results (both the notebook's
-  synthetic recovery and the live Streamlit tab) are precisely a
-  demonstration of where that assumption breaks down against real
-  (or realistically-shaped) market prices — the smile itself is evidence
-  the constant-vol model is wrong, which is the point of computing it.
+- **Constant volatility assumption (Black-Scholes/tree/MC).** These
+  pricers all assume a single constant σ. The IV smile results (both the
+  notebook's synthetic recovery and the live Streamlit tab) are precisely
+  a demonstration of where that assumption breaks down against real (or
+  realistically-shaped) market prices — the smile itself is evidence the
+  constant-vol model is wrong, which is the point of computing it.
+- **Heston is a specific functional form, not a universal fit.** Heston
+  has 5 free parameters; it cannot match an arbitrary smile shape
+  exactly, and the calibration notebook shows a real (small but nonzero)
+  residual against the target skew. `kappa` calibrating to its upper
+  bound in that example is a concrete instance of this: the optimizer is
+  telling you the model wants more mean-reversion speed than the bound
+  allows to fit this particular curve, meaning Heston's shape doesn't
+  perfectly match a quadratic-in-log-moneyness skew. The Feller condition
+  (2·kappa·theta > sigma_v²) is also not enforced — it guarantees
+  variance stays positive in continuous time, but calibrated parameters
+  routinely violate it in practice, and the pricing method used here
+  doesn't require it to produce a valid price.
+- **Heston calibration is a single-expiry fit.** It calibrates one set of
+  parameters to one expiry's smile; it does not jointly calibrate across
+  multiple expiries (a full "vol surface" calibration), which is what a
+  real desk would need for consistent pricing across maturities.
 - **IV solver has no smoothing or surface fit.** Each strike's IV is
   solved independently via Newton-Raphson/Brent on a raw mid-price; there's
   no SVI or spline fit across strikes. A noisy low-volume strike that
   passes the liquidity filters in `data.py` can still produce a
   "converged" but economically noisy IV — nothing here smooths that out.
 - **Live data quality (`data.py`).** Yahoo Finance options data can include
-  stale last-trade prices and wide bid-ask spreads on illiquid strikes.
-  `get_option_chain` filters on minimum volume, minimum open interest, and
-  maximum relative spread, but this is a heuristic filter, not a guarantee
-  of quote quality — thin names or far-dated expiries can still return few
-  or no strikes after filtering.
+  stale last-trade prices, wide bid-ask spreads, and (observed directly
+  during development) bid/ask/open-interest fields that come back zeroed
+  out for an entire chain even when volume is clearly real. `get_option_chain`
+  handles this per-row (falling back to `lastPrice` when bid/ask are
+  absent) and filters on trade recency (`max_quote_age_days`, default 3)
+  in addition to volume/open-interest/spread — but this is a heuristic
+  filter, not a guarantee of quote quality. Thin names, far-dated
+  expiries, or same-day (0DTE) expiries can still return few or no
+  usable strikes after filtering.
 - **Hedging simulation ignores transaction costs by default.** The delta
   rebalancing in `hedging.py` supports a `transaction_cost_bps` parameter,
   but the headline result above uses `0` (frictionless). Real hedging P&L
@@ -151,10 +217,20 @@ streamlit run streamlit_app.py
   high rebalancing frequencies where the "shrinking error vs. more
   frequent trading" tradeoff has a real cost side that this default view
   doesn't show.
-- **Real-world drift vs. risk-neutral drift.** The hedging simulation
-  advances the underlying under the risk-neutral measure (drift = r) for
-  simplicity. A real hedger's P&L would reflect the underlying's actual
-  real-world drift, which need not equal r.
+- **Real-world drift vs. risk-neutral drift.** The hedging and Monte
+  Carlo VaR simulations both advance the underlying under the
+  risk-neutral measure (drift = r) for simplicity. A real hedger's/risk
+  manager's P&L would reflect the underlying's actual real-world drift,
+  which need not equal r.
+- **VaR is single-position, not portfolio-level.** Both VaR methods in
+  `risk.py` price one option position; they don't aggregate correlated
+  positions across a book, which is where real VaR calculations get
+  materially more complex (covariance matrices, netting, etc.).
+- **Stress test grid uses independent spot/vol shocks.** Real market
+  crises typically move spot and vol together in a correlated way (spot
+  down, vol up), not independently across a full grid — the grid format
+  here is deliberately more general/exploratory than a single named
+  historical scenario would be.
 
 ## License
 
