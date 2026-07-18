@@ -1,5 +1,7 @@
 # VolEdge
 
+[![Tests](https://github.com/rishabhsatishjain7/voledge/actions/workflows/tests.yml/badge.svg)](https://github.com/rishabhsatishjain7/voledge/actions/workflows/tests.yml)
+
 A European options pricing and hedging engine: Black-Scholes, a CRR binomial
 tree, and Monte Carlo pricers cross-validated against each other; an implied
 volatility solver with a robust fallback for low-vega strikes; and a
