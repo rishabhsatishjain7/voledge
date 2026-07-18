@@ -192,6 +192,7 @@ def calibrate_heston(
     option_type: OptionType = OptionType.CALL,
     q: float = 0.0,
     initial_guess: HestonParams | None = None,
+    max_nfev: int = 300,
 ) -> tuple[HestonParams, float]:
     """Calibrate Heston parameters to a set of market option prices.
 
@@ -211,6 +212,12 @@ def calibrate_heston(
         initial_guess: Starting HestonParams. Defaults to a generic
             equity-like starting point (mild vol-of-vol, negative skew)
             if not provided.
+        max_nfev: Maximum residual-function evaluations for the
+            optimizer. Each numerical-Jacobian iteration costs roughly
+            (n_params + 1) evaluations, so this scales calibration time
+            directly - lower it for interactive/live-demo use (~20-30
+            gives a fit in a few seconds), raise it for offline/notebook
+            use where accuracy matters more than latency.
 
     Returns:
         (calibrated HestonParams, final RMSE in price units).
@@ -237,7 +244,7 @@ def calibrate_heston(
         x0,
         bounds=(lower, upper),
         args=(S, T, r, q, strikes, market_prices, option_type, weights),
-        max_nfev=300,
+        max_nfev=max_nfev,
     )
 
     v0, kappa, theta, sigma_v, rho = result.x
