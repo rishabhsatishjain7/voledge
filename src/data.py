@@ -48,6 +48,23 @@ def get_spot_price(ticker: str) -> float:
     return float(hist["Close"].iloc[-1])
 
 
+def get_price_history(ticker: str, period: str = "3y") -> pd.Series:
+    """Fetch daily closing prices for a ticker, for use in backtest.py.
+
+    Args:
+        ticker: Underlying ticker symbol, e.g. "AAPL".
+        period: yfinance period string (e.g. "1y", "3y", "5y", "max").
+
+    Returns:
+        Chronologically ordered pandas Series of daily close prices,
+        indexed by date. NaN rows (e.g. from trading halts) are dropped.
+    """
+    hist = yf.Ticker(ticker).history(period=period)
+    if hist.empty:
+        raise ValueError(f"No price history returned for ticker '{ticker}'.")
+    return hist["Close"].dropna()
+
+
 def get_available_expiries(ticker: str) -> list[str]:
     """List available options expiry dates for a ticker."""
     return list(yf.Ticker(ticker).options)
