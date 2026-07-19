@@ -55,6 +55,21 @@ not a directional edge.
   directly against each other, plus a scenario stress-test grid (P&L
   under named spot/vol shocks, independent of any distributional
   assumption).
+- **Historical backtest** (`src/backtest.py`) addresses a gap the
+  Monte Carlo hedging simulation can't close on its own: that simulation
+  tests the hedging strategy's *mechanics* against paths generated under
+  the same GBM model used to compute delta, which proves the
+  implementation is correct but says nothing about real markets, which
+  have volatility clustering and fat tails GBM doesn't capture. This
+  module replays the identical hedging strategy against real historical
+  daily prices via a rolling-window backtest: at each window's inception,
+  volatility is estimated only from data strictly before that point (no
+  lookahead bias), then the position is delta-hedged through the real
+  subsequent price path. The Streamlit app's Historical Backtest tab
+  compares the resulting real-market P&L distribution directly against a
+  GBM simulation using the same average vol - the ratio between the two
+  standard deviations is a direct, visible measure of the "model risk"
+  GBM leaves on the table.
 
 All three pricers agree closely on a plain-vanilla ATM call
 (S=K=100, T=1, r=5%, σ=20%): Black-Scholes **10.4506**, binomial tree
@@ -120,10 +135,27 @@ agreement and get suspicious of a larger gap.
 
 ![Stress test grid](assets/stress_test.png)
 
+### Historical backtest: model risk made visible
+
+Replaying the identical delta-hedging strategy against a synthetic
+fat-tailed (jump-diffusion) path instead of pure GBM produces **1.42x**
+the hedging error (std. dev. 1.2552 vs. 0.8844) at the same rebalancing
+frequency and average vol assumption — direct, quantified evidence of
+what a GBM-only simulation structurally cannot show: a hedger's real
+residual risk when the market doesn't move the way the model assumes.
+
+![Backtest comparison](assets/backtest_comparison.png)
+
+The live Streamlit tab runs this same comparison against real historical
+prices for any ticker — the notebook's version above uses a synthetic
+path specifically so the result is reproducible offline (see Limitations
+for why real historical options data isn't used here).
+
 ## Repo structure
 
 ```
 voledge/
+├── .github/workflows/tests.yml   # CI: pytest + notebook re-execution on every push
 ├── README.md
 ├── src/
 │   ├── pricing/
@@ -134,13 +166,14 @@ voledge/
 │   ├── greeks.py
 │   ├── implied_vol.py
 │   ├── hedging.py
+│   ├── backtest.py
 │   ├── risk.py
 │   └── data.py
 ├── notebooks/
 │   └── analysis.ipynb        # generates every plot in this README
 ├── tests/
-│   └── test_pricing.py       # 31 tests: parity, convergence, boundaries, Greeks, IV, Heston, VaR/stress
-├── streamlit_app.py           # live demo: IV smile + hedging simulator
+│   └── test_pricing.py       # 36 tests: parity, convergence, boundaries, Greeks, IV, Heston, VaR/stress, backtest
+├── streamlit_app.py           # live demo: 5 tabs (smile, hedging, Heston, risk, historical backtest)
 ├── requirements.txt
 └── LICENSE
 ```
@@ -233,6 +266,29 @@ streamlit run streamlit_app.py
   down, vol up), not independently across a full grid — the grid format
   here is deliberately more general/exploratory than a single named
   historical scenario would be.
+- **Backtest windows overlap, so they are not independent draws.**
+  `backtest.py`'s rolling-window design means window *i* and window
+  *i+5* share most of their underlying days — the resulting P&L
+  distribution has real autocorrelation the Monte Carlo comparison
+  distribution doesn't, and its standard deviation understates true
+  sampling uncertainty. Read the real-vs-simulated ratio directionally
+  (evidence GBM misses something), not as a literal statistical
+  confidence interval.
+- **Backtest holds volatility and rate fixed within each window.** The
+  vol assumption is re-estimated fresh at each window's inception (using
+  only trailing data — no lookahead), but held constant for that whole
+  window's hedge, and the risk-free rate is held constant across the
+  *entire* historical sample regardless of how long it spans. Real
+  hedgers update vol views intra-window and face a rate that actually
+  moves over a multi-year sample.
+- **Backtest uses trailing realized vol, not the market's own implied
+  vol at each historical date.** A live desk hedging in real time would
+  see the market's actual implied vol (which can differ meaningfully
+  from trailing realized vol, especially around events), but historical
+  options-chain data for arbitrary past dates isn't readily available
+  through this project's free data source — realized vol is a reasonable
+  practical stand-in but is not the same signal a real trading desk would
+  condition on.
 
 ## License
 
