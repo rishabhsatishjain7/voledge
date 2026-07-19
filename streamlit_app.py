@@ -14,26 +14,32 @@ import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 
-from src.data import get_available_expiries, get_option_chain, get_spot_price, years_to_expiry
+from src.data import (
+    get_available_expiries, get_option_chain, get_spot_price, years_to_expiry,
+    get_price_history,
+)
 from src.implied_vol import implied_volatility
 from src.pricing.black_scholes import OptionType
 from src.hedging import hedging_error_vs_frequency
 from src.pricing.heston import calibrate_heston, heston_price
 from src.risk import parametric_var, monte_carlo_var, stress_test
+from src.backtest import backtest_delta_hedge
 
 st.set_page_config(page_title="VolEdge", layout="wide")
 st.title("VolEdge — Options Pricing & Hedging Engine")
 st.caption(
     "Black-Scholes, binomial tree, Monte Carlo, and Heston (calibrated) pricers "
     "validated against each other; live implied vol smile from real options "
-    "data; delta-hedging simulation; VaR and scenario stress testing. See the "
-    "README for methodology and limitations."
+    "data; delta-hedging simulation (both GBM-simulated and backtested against "
+    "real historical prices); VaR and scenario stress testing. See the README "
+    "for methodology and limitations."
 )
 
 RISK_FREE_RATE = 0.045  # approximate short-term T-bill rate; not fetched live
 
-tab_smile, tab_hedge, tab_heston, tab_risk = st.tabs(
-    ["Live Vol Smile", "Delta-Hedging Simulator", "Heston Calibration", "VaR & Stress Test"]
+tab_smile, tab_hedge, tab_heston, tab_risk, tab_backtest = st.tabs(
+    ["Live Vol Smile", "Delta-Hedging Simulator", "Heston Calibration",
+     "VaR & Stress Test", "Historical Backtest"]
 )
 
 # ---------------------------------------------------------------------------
@@ -423,3 +429,112 @@ with tab_risk:
         st.pyplot(fig)
     else:
         st.info("Set the position parameters above and click Compute VaR & Stress Test.")
+
+# ---------------------------------------------------------------------------
+# Tab 5: Historical backtest — replay the hedging strategy against real prices
+# ---------------------------------------------------------------------------
+with tab_backtest:
+    st.write(
+        "The Delta-Hedging Simulator tab tests the strategy against paths "
+        "*simulated* under the same GBM model used to compute delta - that "
+        "validates the mechanics, but says nothing about real markets, which "
+        "have volatility clustering and fat tails GBM doesn't capture. This "
+        "tab replays the identical hedging strategy against *real* historical "
+        "daily prices instead: a rolling-window backtest where each window "
+        "sells an at-the-money option using only volatility estimated from "
+        "data available *before* that window starts (no lookahead), then "
+        "delta-hedges through the real subsequent price path."
+    )
+
+    col_input, col_chart = st.columns([1, 2])
+
+    with col_input:
+        backtest_ticker = st.text_input("Ticker", value="SPY", key="backtest_ticker").strip().upper()
+        backtest_period = st.selectbox("History length", ["2y", "3y", "5y", "10y"], index=1)
+        backtest_window = st.selectbox("Hedge window (trading days)", [20, 40, 60, 90], index=2)
+        backtest_rebal = st.selectbox("Rebalance every N days", [1, 5, 10, 20], index=1)
+        backtest_side = st.radio("Type", ["Call", "Put"], horizontal=True, key="backtest_type")
+        run_backtest = st.button("Run Historical Backtest", type="primary")
+
+        st.caption(
+            "Rolling windows overlap (window i and window i+5 share most of "
+            "their days), so these outcomes are not independent the way "
+            "Monte Carlo paths are - read this as a directional comparison "
+            "against the simulated distribution, not a literal confidence "
+            "interval. See README Limitations."
+        )
+
+    with col_chart:
+        if backtest_ticker and run_backtest:
+            with st.spinner(f"Fetching {backtest_period} of history for {backtest_ticker}..."):
+                try:
+                    prices = get_price_history(backtest_ticker, period=backtest_period)
+                except Exception as e:
+                    st.error(f"Data fetch failed: {e}")
+                    prices = None
+
+            if prices is not None and len(prices) > 0:
+                opt_type = OptionType.CALL if backtest_side == "Call" else OptionType.PUT
+                try:
+                    with st.spinner("Running rolling-window backtest..."):
+                        result = backtest_delta_hedge(
+                            prices.values, window_days=backtest_window,
+                            rebalance_every=backtest_rebal, option_type=opt_type,
+                        )
+                except ValueError as e:
+                    st.error(str(e))
+                    result = None
+
+                if result is not None and result.n_windows > 0:
+                    # Compare against the GBM-simulated distribution at the
+                    # same window length/rebalancing frequency, using the
+                    # historical sample's own average estimated vol - the
+                    # apples-to-apples comparison the whole tab exists for.
+                    avg_vol = float(np.mean(result.vols_used))
+                    spot_for_sim = float(prices.values[-1])
+                    sim_result = hedging_error_vs_frequency(
+                        S0=spot_for_sim, K=spot_for_sim, T=backtest_window / 252,
+                        r=RISK_FREE_RATE, sigma=avg_vol,
+                        rebalance_counts=[max(round(backtest_window / backtest_rebal), 1)],
+                        option_type=opt_type, n_paths=5000, seed=42,
+                    )
+                    sim_std = list(sim_result.values())[0].std
+                    sim_mean = list(sim_result.values())[0].mean
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        fig1, ax1 = plt.subplots(figsize=(6, 4.5))
+                        ax1.hist(result.pnl, bins=30, alpha=0.75, color="darkorange")
+                        ax1.axvline(0, color="black", linestyle="--", alpha=0.6)
+                        ax1.set_xlabel("Hedging P&L")
+                        ax1.set_title(f"Real Historical Backtest\n({result.n_windows} rolling windows)")
+                        st.pyplot(fig1)
+
+                    with col2:
+                        fig2, ax2 = plt.subplots(figsize=(6, 4.5))
+                        ax2.hist(sim_result[list(sim_result.keys())[0]].pnl, bins=30, alpha=0.75, color="steelblue")
+                        ax2.axvline(0, color="black", linestyle="--", alpha=0.6)
+                        ax2.set_xlabel("Hedging P&L")
+                        ax2.set_title(f"GBM-Simulated Comparison\n(same avg vol = {avg_vol*100:.1f}%)")
+                        st.pyplot(fig2)
+
+                    st.dataframe(
+                        {
+                            "Source": ["Real historical backtest", "GBM simulation (same avg vol)"],
+                            "Mean P&L": [f"{result.mean:+.4f}", f"{sim_mean:+.4f}"],
+                            "Std Dev": [f"{result.std:.4f}", f"{sim_std:.4f}"],
+                            "N": [result.n_windows, 5000],
+                        },
+                        hide_index=True,
+                    )
+                    ratio = result.std / sim_std if sim_std > 0 else float("nan")
+                    st.caption(
+                        f"Real-market hedging error is {ratio:.2f}x the GBM-simulated "
+                        "error at the same average vol assumption. A ratio well above "
+                        "1.0 is evidence of exactly what GBM misses - fat tails, vol "
+                        "clustering, jumps - showing up as extra real-world hedging risk."
+                    )
+                elif result is not None:
+                    st.warning("No valid rolling windows produced - try a longer history period.")
+        else:
+            st.info("Enter a ticker and click Run Historical Backtest.")
