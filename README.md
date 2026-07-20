@@ -70,6 +70,16 @@ not a directional edge.
   GBM simulation using the same average vol - the ratio between the two
   standard deviations is a direct, visible measure of the "model risk"
   GBM leaves on the table.
+- **Full volatility surface** (`src/pricing/svi.py`) addresses the fact
+  that every smile elsewhere in this project - the recovery check, the
+  Heston calibration - is fit one expiry at a time. This module fits an
+  SVI (Gatheral, 2004) curve per expiry across several live expiries at
+  once, then explicitly checks whether the resulting slices are jointly
+  consistent (the calendar-spread no-arbitrage condition: total variance
+  must not decrease as expiry lengthens at a fixed strike) rather than
+  assuming they are. The Streamlit app's Vol Surface tab fetches several
+  real expiries for a ticker, fits a slice to each, reports any
+  arbitrage violations found, and renders the result as a 3D surface.
 
 All three pricers agree closely on a plain-vanilla ATM call
 (S=K=100, T=1, r=5%, σ=20%): Black-Scholes **10.4506**, binomial tree
@@ -151,7 +161,17 @@ prices for any ticker — the notebook's version above uses a synthetic
 path specifically so the result is reproducible offline (see Limitations
 for why real historical options data isn't used here).
 
-## Repo structure
+### Full volatility surface (SVI, multi-expiry)
+
+Fitting SVI per expiry across a synthetic 4-expiry term structure gives
+a tight fit at every slice (RMSE 0.00002-0.00006 in total-variance
+units), but checking the resulting slices against each other finds
+**28 calendar-spread arbitrage violations** on a 41-point moneyness grid
+— confirmed by hand, not a checker bug: independently-fit SVI slices
+have no reason to be mutually consistent, and this is exactly the honest
+result that should surface rather than get papered over.
+
+![Volatility surface](assets/vol_surface.png)
 
 ```
 voledge/
@@ -162,7 +182,8 @@ voledge/
 │   │   ├── black_scholes.py
 │   │   ├── binomial_tree.py
 │   │   ├── monte_carlo.py
-│   │   └── heston.py
+│   │   ├── heston.py
+│   │   └── svi.py
 │   ├── greeks.py
 │   ├── implied_vol.py
 │   ├── hedging.py
@@ -172,8 +193,8 @@ voledge/
 ├── notebooks/
 │   └── analysis.ipynb        # generates every plot in this README
 ├── tests/
-│   └── test_pricing.py       # 36 tests: parity, convergence, boundaries, Greeks, IV, Heston, VaR/stress, backtest
-├── streamlit_app.py           # live demo: 5 tabs (smile, hedging, Heston, risk, historical backtest)
+│   └── test_pricing.py       # 41 tests: parity, convergence, boundaries, Greeks, IV, Heston, VaR/stress, backtest, SVI
+├── streamlit_app.py           # live demo: 6 tabs (smile, hedging, Heston, risk, backtest, vol surface)
 ├── requirements.txt
 └── LICENSE
 ```
@@ -289,6 +310,28 @@ streamlit run streamlit_app.py
   through this project's free data source — realized vol is a reasonable
   practical stand-in but is not the same signal a real trading desk would
   condition on.
+- **SVI slices are fit independently per expiry, not jointly.** As the
+  calendar-arbitrage results above show directly, this can (and did, on
+  the tested synthetic surface) produce violations of the no-arbitrage
+  condition that total variance shouldn't decrease with expiry at a
+  fixed strike. `check_calendar_arbitrage` reports these as a diagnostic
+  rather than silently ignoring them, but this module does not enforce
+  a jointly arbitrage-free fit across expiries - that's a genuinely
+  harder calibration problem (see Gatheral & Jacquier, 2014) and out of
+  scope here.
+- **The surface plot doesn't extrapolate beyond each slice's fitted
+  range.** SVI is a flexible curve-fit, not an economic model with a
+  principled way to extrapolate - the plotted domain is deliberately
+  restricted to the moneyness range every included expiry's slice was
+  actually fit against, at the cost of a narrower visible surface than
+  a full extrapolated plot would show.
+- **Very short-dated slices can have near-zero total variance at some
+  strikes**, where ordinary fitting noise can push the fitted curve a
+  hair negative; `svi_implied_vol` floors this at zero rather than
+  raising an error. This is expected numerical behavior for genuinely
+  tiny-variance regions (very short time to expiry), not a sign of a
+  bad fit - see the `T=0.1` slice in the notebook's surface section for
+  a concrete example.
 
 ## License
 
