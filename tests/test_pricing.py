@@ -19,6 +19,10 @@ from src.pricing.monte_carlo import mc_price
 from src.pricing.heston import HestonParams, heston_price, calibrate_heston
 from src.risk import parametric_var, monte_carlo_var, stress_test
 from src.backtest import backtest_delta_hedge, estimate_realized_vol
+from src.pricing.svi import (
+    SVIParams, raw_svi_total_variance, svi_implied_vol, log_forward_moneyness,
+    calibrate_svi_slice, check_calendar_arbitrage,
+)
 from src.greeks import compute_greeks
 from src.implied_vol import implied_volatility
 
@@ -220,7 +224,13 @@ class TestHeston:
             [heston_price(S, k, T, r, true_params, OptionType.CALL) for k in strikes]
         )
 
-        calibrated, rmse = calibrate_heston(S, T, r, strikes, true_prices, OptionType.CALL)
+        # max_nfev capped well below the default 300: this well-posed
+        # recovery problem converges to a near-perfect fit in ~30-40
+        # evaluations, so there's no reason to pay for hundreds more in
+        # every CI run - see calibrate_heston's max_nfev docstring.
+        calibrated, rmse = calibrate_heston(
+            S, T, r, strikes, true_prices, OptionType.CALL, max_nfev=40
+        )
 
         assert rmse < 0.05  # prices in this scenario range roughly $0.50-$18
 
@@ -330,6 +340,69 @@ class TestBacktest:
         prices = self._make_gbm_path(seed=5, n_days=50)  # too short for defaults
         with pytest.raises(ValueError):
             backtest_delta_hedge(prices, window_days=60, vol_lookback=60)
+
+
+class TestSVI:
+    def test_recovers_synthetic_skew(self):
+        """SVI, as a flexible curve-fit (not a constrained economic
+        model like Heston), should fit an arbitrary smooth skew shape
+        very tightly - this checks it actually does, not just that it
+        runs without error."""
+        S, T, r = 100.0, 0.5, 0.045
+        strikes = np.arange(70, 131, 2.5)
+
+        def synthetic_skew(strike, spot):
+            m = math.log(strike / spot)
+            return 0.18 - 0.35 * m + 0.9 * m**2
+
+        true_ivs = np.array([synthetic_skew(k, S) for k in strikes])
+        k = log_forward_moneyness(strikes, S, T, r)
+
+        fitted, rmse = calibrate_svi_slice(k, true_ivs, T)
+        fitted_ivs = svi_implied_vol(k, T, fitted)
+
+        assert rmse < 1e-3
+        assert np.max(np.abs(fitted_ivs - true_ivs)) < 0.01  # within 1 vol point everywhere
+
+    def test_invalid_params_raise(self):
+        with pytest.raises(ValueError):
+            SVIParams(a=0.0, b=-0.1, rho=0.0, m=0.0, sigma=0.2)  # negative b
+        with pytest.raises(ValueError):
+            SVIParams(a=0.0, b=0.3, rho=1.5, m=0.0, sigma=0.2)  # rho out of range
+        with pytest.raises(ValueError):
+            SVIParams(a=0.0, b=0.3, rho=0.0, m=0.0, sigma=-0.1)  # non-positive sigma
+
+    def test_total_variance_symmetric_case(self):
+        """With rho=0, the SVI curve should be symmetric around k=m -
+        a direct check that the rho term is doing what it's supposed to."""
+        params = SVIParams(a=0.04, b=0.3, rho=0.0, m=0.0, sigma=0.2)
+        w_left = raw_svi_total_variance(-0.3, params)
+        w_right = raw_svi_total_variance(0.3, params)
+        assert w_left == pytest.approx(w_right, abs=1e-9)
+
+    def test_calendar_arbitrage_check_detects_genuine_violation(self):
+        """Construct two slices where total variance at k=0 clearly
+        decreases from the shorter to the longer expiry - the checker
+        must flag this specific, verifiable violation."""
+        short_slice = SVIParams(a=0.05, b=0.3, rho=-0.3, m=0.0, sigma=0.2)  # w(0) = 0.05 + 0.3*0.2 = 0.11
+        long_slice = SVIParams(a=0.01, b=0.1, rho=-0.3, m=0.0, sigma=0.2)   # w(0) = 0.01 + 0.1*0.2 = 0.03
+        surface = {0.25: short_slice, 1.0: long_slice}
+
+        violations = check_calendar_arbitrage(surface, k_grid=np.array([0.0]))
+        assert len(violations) == 1
+        assert violations[0][1] == 0.25 and violations[0][2] == 1.0
+
+    def test_calendar_arbitrage_check_passes_consistent_surface(self):
+        """A genuinely consistent surface (variance strictly increasing
+        in T at every k, by construction) should report zero violations -
+        checks the function doesn't false-positive on a clean case."""
+        surface = {
+            0.25: SVIParams(a=0.02, b=0.2, rho=-0.3, m=0.0, sigma=0.2),
+            0.5: SVIParams(a=0.04, b=0.3, rho=-0.3, m=0.0, sigma=0.2),
+            1.0: SVIParams(a=0.08, b=0.4, rho=-0.3, m=0.0, sigma=0.2),
+        }
+        violations = check_calendar_arbitrage(surface, k_grid=np.linspace(-0.5, 0.5, 11))
+        assert len(violations) == 0
 
 
 class TestImpliedVol:
