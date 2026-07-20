@@ -11,6 +11,7 @@ Run locally with:  streamlit run streamlit_app.py
 from __future__ import annotations
 
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 - registers 3D projection
 import numpy as np
 import streamlit as st
 
@@ -24,6 +25,9 @@ from src.hedging import hedging_error_vs_frequency
 from src.pricing.heston import calibrate_heston, heston_price
 from src.risk import parametric_var, monte_carlo_var, stress_test
 from src.backtest import backtest_delta_hedge
+from src.pricing.svi import (
+    calibrate_svi_slice, svi_implied_vol, log_forward_moneyness, check_calendar_arbitrage,
+)
 
 st.set_page_config(page_title="VolEdge", layout="wide")
 st.title("VolEdge — Options Pricing & Hedging Engine")
@@ -31,15 +35,16 @@ st.caption(
     "Black-Scholes, binomial tree, Monte Carlo, and Heston (calibrated) pricers "
     "validated against each other; live implied vol smile from real options "
     "data; delta-hedging simulation (both GBM-simulated and backtested against "
-    "real historical prices); VaR and scenario stress testing. See the README "
-    "for methodology and limitations."
+    "real historical prices); VaR and scenario stress testing; full multi-"
+    "expiry SVI volatility surface. See the README for methodology and "
+    "limitations."
 )
 
 RISK_FREE_RATE = 0.045  # approximate short-term T-bill rate; not fetched live
 
-tab_smile, tab_hedge, tab_heston, tab_risk, tab_backtest = st.tabs(
+tab_smile, tab_hedge, tab_heston, tab_risk, tab_backtest, tab_surface = st.tabs(
     ["Live Vol Smile", "Delta-Hedging Simulator", "Heston Calibration",
-     "VaR & Stress Test", "Historical Backtest"]
+     "VaR & Stress Test", "Historical Backtest", "Vol Surface (SVI)"]
 )
 
 # ---------------------------------------------------------------------------
@@ -538,3 +543,157 @@ with tab_backtest:
                     st.warning("No valid rolling windows produced - try a longer history period.")
         else:
             st.info("Enter a ticker and click Run Historical Backtest.")
+
+# ---------------------------------------------------------------------------
+# Tab 6: Full multi-expiry SVI volatility surface
+# ---------------------------------------------------------------------------
+MAX_SURFACE_EXPIRIES = 5
+
+
+def _svi_iv_for_chain(calls_df, spot, T, r):
+    """Solve market IVs for a cleaned chain, returning (k, iv) arrays
+    ready for calibrate_svi_slice."""
+    strikes, ivs = [], []
+    for _, row in calls_df.iterrows():
+        result = implied_volatility(row["mid"], spot, row["strike"], T, r, OptionType.CALL)
+        if result.converged and result.iv is not None:
+            strikes.append(row["strike"])
+            ivs.append(result.iv)
+    if not strikes:
+        return np.array([]), np.array([])
+    strikes = np.array(strikes)
+    ivs = np.array(ivs)
+    k = log_forward_moneyness(strikes, spot, T, r)
+    return k, ivs
+
+
+with tab_surface:
+    st.write(
+        "Every other tab in this app fits one expiry at a time. This tab fits "
+        "a full surface: an SVI (Gatheral) curve per expiry, across several "
+        "live expiries at once, then checks whether the resulting slices are "
+        "jointly consistent (the calendar-spread no-arbitrage condition) "
+        "before visualizing the whole thing as a 3D surface."
+    )
+
+    col_input, col_chart = st.columns([1, 2])
+
+    with col_input:
+        surface_ticker = st.text_input("Ticker", value="AAPL", key="surface_ticker").strip().upper()
+
+        if surface_ticker:
+            try:
+                all_expiries = get_available_expiries(surface_ticker)
+            except Exception as e:
+                st.error(f"Could not fetch expiries for '{surface_ticker}': {e}")
+                all_expiries = []
+
+            if all_expiries:
+                default_selection = all_expiries[1: 1 + MAX_SURFACE_EXPIRIES] or all_expiries[:MAX_SURFACE_EXPIRIES]
+                selected_expiries = st.multiselect(
+                    f"Expiries to include (up to {MAX_SURFACE_EXPIRIES})",
+                    all_expiries, default=default_selection,
+                )
+                build_surface_button = st.button("Fetch & Build Surface", type="primary")
+            else:
+                selected_expiries = []
+                build_surface_button = False
+
+        st.caption(
+            "Skips same-day (0DTE) expiries automatically - zero time value "
+            "means no implied vol is solvable there (see the Live Vol Smile "
+            "tab's known behavior). Pick expiries a few weeks apart for the "
+            "clearest surface shape."
+        )
+
+    with col_chart:
+        if surface_ticker and all_expiries and build_surface_button:
+            if len(selected_expiries) > MAX_SURFACE_EXPIRIES:
+                st.warning(f"Using only the first {MAX_SURFACE_EXPIRIES} selected expiries for responsiveness.")
+                selected_expiries = selected_expiries[:MAX_SURFACE_EXPIRIES]
+
+            with st.spinner(f"Fetching {len(selected_expiries)} expiries and fitting SVI slices..."):
+                try:
+                    surface_spot = get_spot_price(surface_ticker)
+                except Exception as e:
+                    st.error(f"Could not fetch spot price: {e}")
+                    surface_spot = None
+
+                svi_slices = {}
+                k_ranges = []
+                fit_rows = []
+
+                if surface_spot is not None:
+                    for expiry in selected_expiries:
+                        T = years_to_expiry(expiry)
+                        if T <= 0:
+                            continue  # same-day expiry: no time value, skip
+                        try:
+                            calls, _ = get_option_chain(surface_ticker, expiry)
+                        except Exception:
+                            continue
+                        if calls.empty:
+                            continue
+
+                        k, ivs = _svi_iv_for_chain(calls, surface_spot, T, RISK_FREE_RATE)
+                        if len(k) < 5:
+                            continue  # too few points to fit reliably
+
+                        fitted, rmse = calibrate_svi_slice(k, ivs, T)
+                        svi_slices[T] = fitted
+                        k_ranges.append((k.min(), k.max()))
+                        fit_rows.append({"Expiry": expiry, "T (yrs)": f"{T:.3f}",
+                                          "Strikes used": len(k), "RMSE": f"{rmse:.6f}"})
+
+            if not svi_slices:
+                st.warning(
+                    "Couldn't fit any expiries - try selecting different "
+                    "expiries or a more liquid ticker."
+                )
+            elif len(svi_slices) < 2:
+                st.warning(
+                    "Only one expiry fit successfully - need at least 2 for a "
+                    "surface. Try selecting more expiries."
+                )
+            else:
+                st.write("**Per-expiry SVI fits:**")
+                st.dataframe(fit_rows, hide_index=True)
+
+                violations = check_calendar_arbitrage(svi_slices)
+                if violations:
+                    st.warning(
+                        f"{len(violations)} calendar-spread arbitrage violations found "
+                        "across the fitted slices - expected for independently-fit "
+                        "SVI (see README Limitations), not a bug in this app."
+                    )
+                else:
+                    st.success("No calendar-spread arbitrage violations found on the checked grid.")
+
+                safe_min = max(r[0] for r in k_ranges)
+                safe_max = min(r[1] for r in k_ranges)
+                if safe_max <= safe_min:
+                    st.warning("Fitted expiries don't share a common moneyness range - can't build a surface plot.")
+                else:
+                    expiries_sorted = sorted(svi_slices.keys())
+                    k_common = np.linspace(safe_min, safe_max, 40)
+                    K_mesh, T_mesh = np.meshgrid(k_common, expiries_sorted)
+                    IV_mesh = np.zeros_like(K_mesh)
+                    for i, T in enumerate(expiries_sorted):
+                        IV_mesh[i, :] = svi_implied_vol(k_common, T, svi_slices[T]) * 100
+
+                    fig = plt.figure(figsize=(9, 6.5))
+                    ax = fig.add_subplot(111, projection="3d")
+                    surf = ax.plot_surface(K_mesh, T_mesh, IV_mesh, cmap="viridis", edgecolor="none", alpha=0.9)
+                    ax.set_xlabel("Log-forward-moneyness (k)")
+                    ax.set_ylabel("Time to expiry (years)")
+                    ax.set_zlabel("Implied Vol (%)")
+                    ax.set_title(f"{surface_ticker} SVI Volatility Surface")
+                    fig.colorbar(surf, shrink=0.5, label="IV (%)")
+                    st.pyplot(fig)
+                    st.caption(
+                        "Plotted domain restricted to the moneyness range every "
+                        "selected expiry's slice was actually fit against - not "
+                        "extrapolated beyond the live data."
+                    )
+        else:
+            st.info("Enter a ticker, select expiries, and click Fetch & Build Surface.")
