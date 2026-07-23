@@ -16,7 +16,7 @@ not a directional edge.
 
 ![Hedging error vs rebalancing frequency](assets/hedging_error.png)
 
-**Live demo:** [Streamlit app link — pick a ticker, see the live IV smile, run the hedging simulator]
+**Live demo:** [voledge on Streamlit Cloud](https://voledge-3a8nqewc75dhntseomkzwe.streamlit.app) — pick a ticker, see the live IV smile, run the hedging simulator
 
 ---
 
@@ -207,7 +207,10 @@ locked inside one notebook.
 
 ## Running it
 
-```bash
+Requires Python 3.9–3.12 (numpy==1.26.4 has no prebuilt wheels for newer Python versions).
+
+```
+# Install dependencies (Python 3.9–3.12 required — see note above)
 pip install -r requirements.txt
 
 # Run the test suite
